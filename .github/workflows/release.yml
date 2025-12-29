@@ -2,6 +2,11 @@ name: Build and Release
 
 on:
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to create when running on a branch (e.g. v1.2.3 or nightly-2025-12-29)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -44,7 +49,25 @@ jobs:
           name: audio-priority
           path: release/audio-priority.zip
 
+      - name: Create Manual Release (from branch)
+        if: github.event_name == 'workflow_dispatch' && inputs.tag_name != '' && !startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ inputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          name: Manual Release (${{ inputs.tag_name }})
+          body: |
+            Manual release from workflow dispatch.
+
+            **Commit:** ${{ github.sha }}
+            **Date:** ${{ github.event.head_commit.timestamp }}
+          files: release/audio-priority.zip
+          prerelease: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Create Tagged Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v1
         with:
           files: release/audio-priority.zip
