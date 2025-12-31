@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.2.0]
 ### Added
 - Default `audio-priority` output now lists priorities; supports `--input`, `--output`, and `--json` filters.
 - `--version` flag (prints the version only) and help links to GitHub issues/pull requests.
