@@ -38,10 +38,10 @@ jobs:
           text = path.read_text()
           new_text = re.sub(r"MARKETING_VERSION = [^;]+;", f"MARKETING_VERSION = {version};", text)
           if text == new_text:
-              print("MARKETING_VERSION not updated", file=sys.stderr)
-              sys.exit(1)
-          path.write_text(new_text)
-          print(f"Set MARKETING_VERSION to {version}")
+              print(f"MARKETING_VERSION already {version}")
+          else:
+              path.write_text(new_text)
+              print(f"Set MARKETING_VERSION to {version}")
           PY
 
       - name: Update changelog version
