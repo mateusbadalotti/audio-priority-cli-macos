@@ -55,9 +55,6 @@ audio-priority list --output
 
 # Set output priority by index (1 = highest priority)
 audio-priority set output 2 1 3
-
-# Apply the highest-priority connected devices now
-audio-priority apply
 ```
 
 ## Common Commands
