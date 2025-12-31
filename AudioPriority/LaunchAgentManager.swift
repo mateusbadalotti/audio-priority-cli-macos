@@ -143,7 +143,7 @@ struct LaunchAgentManager {
     private static func plistDictionary(programPath: String) -> [String: Any] {
         [
             "Label": label,
-            "ProgramArguments": [programPath, "run"],
+            "ProgramArguments": [programPath, "daemon"],
             "RunAtLoad": true,
             "KeepAlive": true,
             "StandardOutPath": stdoutLogURL.path,

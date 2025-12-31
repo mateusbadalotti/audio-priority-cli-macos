@@ -10,14 +10,33 @@ final class AudioPriorityCLI {
         args.removeFirst()
 
         guard let command = args.first else {
-            printUsage()
+            handlePriorities([])
             return
         }
 
         let remaining = Array(args.dropFirst())
 
+        if command.hasPrefix("-") {
+            if command == "--version" || command == "-v" {
+                handleVersion()
+                return
+            }
+            if command == "--help" || command == "-h" || command == "help" {
+                printUsage()
+                return
+            }
+            let allowed = Set(["--output", "--input", "--json"])
+            if args.allSatisfy({ allowed.contains($0) }) {
+                handlePriorities(args)
+                return
+            }
+            print("Unknown option(s): \(args.joined(separator: ", "))\n")
+            printUsage()
+            return
+        }
+
         switch command {
-        case "run":
+        case "daemon":
             runDaemon()
         case "install":
             handleInstall(remaining)
@@ -31,16 +50,16 @@ final class AudioPriorityCLI {
             handleStatus(remaining)
         case "list":
             handleList(remaining)
-        case "priorities":
-            handlePriorities(remaining)
         case "set":
             handleSet(remaining)
-        case "forget":
-            handleForget(remaining)
+        case "forget-disconnected":
+            handleForgetDisconnected(remaining)
         case "mode":
             handleMode(remaining)
         case "apply":
             handleApply()
+        case "version", "--version", "-v":
+            handleVersion()
         case "help", "-h", "--help":
             printUsage()
         default:
@@ -337,52 +356,48 @@ final class AudioPriorityCLI {
         print("Priority updated for \(type.rawValue) devices")
     }
 
-    private func handleForget(_ args: [String]) {
+    private func handleForgetDisconnected(_ args: [String]) {
         var working = args
         let outputOnly = takeFlag("--output", from: &working)
         let inputOnly = takeFlag("--input", from: &working)
-        let includeKnown = takeFlag("--known", from: &working)
 
         guard !(outputOnly && inputOnly) else {
-            print("Usage: audio-priority forget --output <indexes...> OR audio-priority forget --input <indexes...>")
+            print("Usage: audio-priority forget-disconnected [--output | --input]")
             exit(1)
         }
 
-        let type: AudioDeviceType
-        if outputOnly || inputOnly {
-            type = outputOnly ? .output : .input
-        } else {
-            guard !working.isEmpty else {
-                print("Usage: audio-priority forget <input|output> <indexes...>")
-                exit(1)
-            }
-            type = parseType(working.removeFirst())
+        guard working.isEmpty else {
+            print("Unexpected arguments: \(working.joined(separator: ", "))")
+            exit(1)
         }
 
-        let identifiers = identifierResolver.splitIdentifiers(working)
-        guard !identifiers.isEmpty else {
-            if outputOnly || inputOnly {
-                print("Usage: audio-priority forget --\(type == .output ? "output" : "input") <indexes...>")
+        controller.refreshDevices()
+        let known = controller.priorityManager.getKnownDevices()
+        let connectedOutputs = Set(controller.outputDevices.map { $0.uid })
+        let connectedInputs = Set(controller.inputDevices.map { $0.uid })
+        let includeOutputs = !inputOnly
+        let includeInputs = !outputOnly
+
+        var count = 0
+        for device in known {
+            if device.isInput {
+                guard includeInputs, !connectedInputs.contains(device.uid) else { continue }
+                controller.forgetDevice(uid: device.uid, type: .input)
+                count += 1
             } else {
-                print("Usage: audio-priority forget <input|output> <indexes...>")
+                guard includeOutputs, !connectedOutputs.contains(device.uid) else { continue }
+                controller.forgetDevice(uid: device.uid, type: .output)
+                count += 1
             }
-            exit(1)
         }
 
-        let devices: [AudioDevice]
-        if includeKnown {
-            devices = knownDevices(for: type)
+        if count == 0 {
+            print("No disconnected devices to forget")
+        } else if count == 1 {
+            print("Forgot 1 disconnected device")
         } else {
-            controller.refreshDevices()
-            devices = type == .output ? controller.outputDevices : controller.inputDevices
+            print("Forgot \(count) disconnected devices")
         }
-
-        let uids = resolveUIDsOrExit(for: type, identifiers: identifiers, devices: devices, listKnown: includeKnown)
-        var seen = Set<String>()
-        for uid in uids where seen.insert(uid).inserted {
-            controller.forgetDevice(uid: uid, type: type)
-        }
-        print("Device forgotten")
     }
 
     private func handleMode(_ args: [String]) {
@@ -408,6 +423,10 @@ final class AudioPriorityCLI {
     private func handleApply() {
         controller.applyHighestPriorityDevices()
         print("Applied highest priority devices")
+    }
+
+    private func handleVersion() {
+        print(versionString())
     }
 
     private func printPriorityList(title: String, type: AudioDeviceType, known: [StoredDevice]) {
@@ -530,14 +549,6 @@ final class AudioPriorityCLI {
                 print("Use audio-priority list --\(type == .output ? "output" : "input") to see indexes.")
             }
             exit(1)
-        }
-    }
-
-    private func knownDevices(for type: AudioDeviceType) -> [AudioDevice] {
-        let known = controller.priorityManager.getKnownDevices()
-            .filter { $0.isInput == (type == .input) }
-        return known.map { device in
-            AudioDevice(id: 0, uid: device.uid, name: device.name, type: type, isConnected: false)
         }
     }
 
@@ -746,27 +757,43 @@ final class AudioPriorityCLI {
 Audio Priority CLI
 
 Usage:
-  audio-priority run
+  audio-priority [--output] [--input] [--json]
   audio-priority install [--path <dir|path>] [--bin <path>] [--no-start]
   audio-priority uninstall [--keep-binary]
   audio-priority start
   audio-priority stop
   audio-priority status [--json]
   audio-priority list [--output] [--input] [--known] [--json]
-  audio-priority priorities [--output] [--input] [--json]
   audio-priority set <input|output> <indexes...>
   audio-priority set --output <indexes...>
   audio-priority set --input <indexes...>
   audio-priority set <input|output> --uids <uids...>
   audio-priority set --output --uids <uids...>
   audio-priority set --input --uids <uids...>
-  audio-priority forget <input|output> <indexes...>
-  audio-priority forget --output <indexes...>
-  audio-priority forget --input <indexes...>
-  audio-priority forget --known --output <indexes...>
-  audio-priority forget --known --input <indexes...>
+  audio-priority forget-disconnected [--output | --input]
   audio-priority mode <auto|manual>
   audio-priority apply
+  audio-priority --version
+  audio-priority --help
+
+Project:
+  Issues: https://github.com/mateusbadalotti/audio-priority-cli-macos/issues
+  Pull requests: https://github.com/mateusbadalotti/audio-priority-cli-macos/pulls
 """)
     }
+}
+
+private func versionString() -> String {
+    let bundle = Bundle.main
+    let short = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+    let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+    if let short, !short.isEmpty {
+        return short
+    }
+
+    if let build, !build.isEmpty {
+        return build
+    }
+
+    return "version unknown"
 }
