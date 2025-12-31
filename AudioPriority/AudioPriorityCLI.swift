@@ -1,8 +1,9 @@
 import Foundation
-import CoreAudio
+import AudioPriorityCore
 
 final class AudioPriorityCLI {
     private let controller = AudioPriorityController()
+    private let identifierResolver = IdentifierResolver()
 
     func run() {
         var args = CommandLine.arguments
@@ -21,15 +22,17 @@ final class AudioPriorityCLI {
         case "install":
             handleInstall(remaining)
         case "uninstall":
-            handleUninstall()
+            handleUninstall(remaining)
         case "start":
             handleStart()
         case "stop":
             handleStop()
         case "status":
-            handleStatus()
+            handleStatus(remaining)
         case "list":
             handleList(remaining)
+        case "priorities":
+            handlePriorities(remaining)
         case "set":
             handleSet(remaining)
         case "forget":
@@ -56,8 +59,9 @@ final class AudioPriorityCLI {
 
     private func handleInstall(_ args: [String]) {
         var working = args
-        let destinationPath = takeOption("--path", from: &working)
-        let sourcePath = takeOption("--bin", from: &working) ?? currentExecutablePath()
+        let destinationPathArg = takeOption("--path", from: &working)
+        let sourcePathArg = takeOption("--bin", from: &working)
+        let sourcePath = sourcePathArg ?? currentExecutablePath()
         let noStart = takeFlag("--no-start", from: &working)
 
         guard working.isEmpty else {
@@ -65,32 +69,52 @@ final class AudioPriorityCLI {
             return
         }
 
-        var programPath = sourcePath
-        if let destinationPath {
-            do {
-                programPath = try installBinary(from: sourcePath, to: destinationPath)
-            } catch {
-                print("Install failed: \(error.localizedDescription)")
-                exit(1)
-            }
+        guard validateBinaryPath(sourcePath) else {
+            print("Binary not found or not executable: \(sourcePath)")
+            exit(1)
         }
 
+        let destinationPath = resolveInstallDestination(pathArg: destinationPathArg, sourcePathArg: sourcePathArg)
+        var programPath = sourcePath
+        var didCopy = false
+
         do {
+            if let destinationPath {
+                programPath = try installBinary(from: sourcePath, to: destinationPath)
+                didCopy = true
+            }
+
+            try requireFrameworkPresent(near: programPath)
+
             try LaunchAgentManager.install(programPath: programPath, start: !noStart)
             print("LaunchAgent installed at \(LaunchAgentManager.agentURL.path)")
         } catch {
-            print("Failed to install LaunchAgent: \(error.localizedDescription)")
+            if didCopy {
+                cleanupInstall(at: programPath)
+            }
+            print("Install failed: \(error.localizedDescription)")
             exit(1)
         }
     }
 
-    private func handleUninstall() {
+    private func handleUninstall(_ args: [String]) {
+        var working = args
+        let keepBinary = takeFlag("--keep-binary", from: &working)
+        guard working.isEmpty else {
+            print("Unexpected arguments: \(working.joined(separator: ", "))")
+            return
+        }
+
+        let programPath = launchAgentProgramPath()
         do {
             try LaunchAgentManager.uninstall()
             print("LaunchAgent removed")
         } catch {
             print("Failed to uninstall LaunchAgent: \(error.localizedDescription)")
             exit(1)
+        }
+        if !keepBinary, let programPath {
+            removeInstalledBinary(at: programPath)
         }
     }
 
@@ -99,17 +123,52 @@ final class AudioPriorityCLI {
             print("LaunchAgent not installed. Run: audio-priority install")
             exit(1)
         }
-        LaunchAgentManager.start()
-        print("LaunchAgent started")
+        do {
+            try LaunchAgentManager.start()
+            print("LaunchAgent started")
+        } catch {
+            print("Failed to start LaunchAgent: \(error.localizedDescription)")
+            exit(1)
+        }
     }
 
     private func handleStop() {
-        LaunchAgentManager.stop()
-        print("LaunchAgent stopped")
+        do {
+            try LaunchAgentManager.stop()
+            print("LaunchAgent stopped")
+        } catch {
+            print("Failed to stop LaunchAgent: \(error.localizedDescription)")
+            exit(1)
+        }
     }
 
     private func handleStatus() {
+        handleStatus([])
+    }
+
+    private func handleStatus(_ args: [String]) {
+        var working = args
+        let jsonOutput = takeFlag("--json", from: &working)
+
+        guard working.isEmpty else {
+            print("Unexpected arguments: \(working.joined(separator: ", "))")
+            return
+        }
+
         let status = LaunchAgentManager.status()
+        if jsonOutput {
+            controller.refreshDevices()
+            let payload = AudioPriorityJSONStatusPayload(
+                launchAgentInstalled: status.installed,
+                launchAgentRunning: status.loaded,
+                mode: controller.isCustomMode ? "manual" : "auto",
+                defaultInput: AudioPriorityJSON.defaultDevice(id: controller.currentInputId, devices: controller.inputDevices),
+                defaultOutput: AudioPriorityJSON.defaultDevice(id: controller.currentOutputId, devices: controller.outputDevices)
+            )
+            printJSON(payload)
+            return
+        }
+
         print("LaunchAgent installed: \(status.installed ? "yes" : "no")")
         print("LaunchAgent running: \(status.loaded ? "yes" : "no")")
         print("Mode: \(controller.isCustomMode ? "manual" : "auto")")
@@ -120,6 +179,7 @@ final class AudioPriorityCLI {
         let outputOnly = takeFlag("--output", from: &working)
         let inputOnly = takeFlag("--input", from: &working)
         let includeKnown = takeFlag("--known", from: &working)
+        let jsonOutput = takeFlag("--json", from: &working)
 
         guard working.isEmpty else {
             print("Unexpected arguments: \(working.joined(separator: ", "))")
@@ -136,6 +196,11 @@ final class AudioPriorityCLI {
             types = [.output, .input]
         }
 
+        if jsonOutput {
+            printJSONList(types: types, includeKnown: includeKnown)
+            return
+        }
+
         if includeKnown {
             listKnownDevices(types: types)
             return
@@ -143,10 +208,58 @@ final class AudioPriorityCLI {
 
         controller.refreshDevices()
         if types.contains(.output) {
-            printDevices(title: "Output", devices: controller.outputDevices, currentId: controller.currentOutputId)
+            printDevices(title: "Output", devices: controller.outputDevices)
         }
         if types.contains(.input) {
-            printDevices(title: "Input", devices: controller.inputDevices, currentId: controller.currentInputId)
+            printDevices(title: "Input", devices: controller.inputDevices)
+        }
+    }
+
+    private func handlePriorities(_ args: [String]) {
+        var working = args
+        let outputOnly = takeFlag("--output", from: &working)
+        let inputOnly = takeFlag("--input", from: &working)
+        let jsonOutput = takeFlag("--json", from: &working)
+
+        guard working.isEmpty else {
+            print("Unexpected arguments: \(working.joined(separator: ", "))")
+            return
+        }
+
+        let types: [AudioDeviceType]
+        if outputOnly || inputOnly {
+            var selected: [AudioDeviceType] = []
+            if outputOnly { selected.append(.output) }
+            if inputOnly { selected.append(.input) }
+            types = selected
+        } else {
+            types = [.output, .input]
+        }
+
+        controller.refreshDevices()
+        let known = controller.priorityManager.getKnownDevices()
+        let connected = controller.outputDevices + controller.inputDevices
+
+        if jsonOutput {
+            let payload = AudioPriorityJSON.prioritiesPayload(
+                priorityOutput: controller.priorityManager.getPriorityUIDs(type: .output),
+                priorityInput: controller.priorityManager.getPriorityUIDs(type: .input),
+                knownDevices: known,
+                connectedDevices: connected
+            )
+            let filtered = AudioPriorityJSONPrioritiesPayload(
+                output: types.contains(.output) ? payload.output : [],
+                input: types.contains(.input) ? payload.input : []
+            )
+            printJSON(filtered)
+            return
+        }
+
+        if types.contains(.output) {
+            printPriorityList(title: "Output Priority", type: .output, known: known)
+        }
+        if types.contains(.input) {
+            printPriorityList(title: "Input Priority", type: .input, known: known)
         }
     }
 
@@ -154,41 +267,121 @@ final class AudioPriorityCLI {
         var working = args
         let outputOnly = takeFlag("--output", from: &working)
         let inputOnly = takeFlag("--input", from: &working)
+        let uidsMode = takeFlag("--uids", from: &working)
 
         if outputOnly || inputOnly {
             guard !(outputOnly && inputOnly) else {
-                print("Usage: audio-priority set --output <uids|indexes...> OR audio-priority set --input <uids|indexes...>")
+                print("Usage: audio-priority set --output <indexes...> OR audio-priority set --input <indexes...>")
                 exit(1)
             }
             let type: AudioDeviceType = outputOnly ? .output : .input
             guard !working.isEmpty else {
-                print("Usage: audio-priority set --\(type == .output ? "output" : "input") <uids|indexes...>")
+                print("Usage: audio-priority set --\(type == .output ? "output" : "input") <indexes...>")
                 exit(1)
             }
-            let identifiers = splitIdentifiers(working)
-            let uids = resolveUIDs(for: type, identifiers: identifiers)
-            controller.setPriorities(type: type, orderedUIDs: uids)
+            if uidsMode {
+                let uids = identifierResolver.splitIdentifiers(working)
+                guard !uids.isEmpty else {
+                    print("Usage: audio-priority set --\(type == .output ? "output" : "input") --uids <uids...>")
+                    exit(1)
+                }
+                controller.setPriorities(type: type, orderedUIDs: uids, refresh: false)
+            } else {
+                let identifiers = identifierResolver.splitIdentifiers(working)
+                guard !identifiers.isEmpty else {
+                    print("Usage: audio-priority set --\(type == .output ? "output" : "input") <indexes...>")
+                    exit(1)
+                }
+                controller.refreshDevices()
+                let devices = type == .output ? controller.outputDevices : controller.inputDevices
+                let uids = resolveUIDsOrExit(for: type, identifiers: identifiers, devices: devices, listKnown: false)
+                controller.setPriorities(type: type, orderedUIDs: uids, refresh: false)
+            }
             print("Priority updated for \(type.rawValue) devices")
             return
         }
 
         guard args.count >= 2 else {
-            print("Usage: audio-priority set <input|output> <uid|index...>")
+            print("Usage: audio-priority set <input|output> <indexes...>")
             exit(1)
         }
-        let type = parseType(args[0])
-        let identifiers = splitIdentifiers(Array(args.dropFirst()))
-        let uids = resolveUIDs(for: type, identifiers: identifiers)
-        controller.setPriorities(type: type, orderedUIDs: uids)
+        var positional = args
+        let positionalUidsMode = positional.contains("--uids")
+        if positionalUidsMode {
+            positional.removeAll { $0 == "--uids" }
+        }
+        guard !positional.isEmpty else {
+            print("Usage: audio-priority set <input|output> <indexes...>")
+            exit(1)
+        }
+        let type = parseType(positional[0])
+        let remaining = Array(positional.dropFirst())
+        if positionalUidsMode {
+            let uids = identifierResolver.splitIdentifiers(remaining)
+            guard !uids.isEmpty else {
+                print("Usage: audio-priority set <input|output> --uids <uids...>")
+                exit(1)
+            }
+            controller.setPriorities(type: type, orderedUIDs: uids, refresh: false)
+        } else {
+            let identifiers = identifierResolver.splitIdentifiers(remaining)
+            guard !identifiers.isEmpty else {
+                print("Usage: audio-priority set <input|output> <indexes...>")
+                exit(1)
+            }
+            controller.refreshDevices()
+            let devices = type == .output ? controller.outputDevices : controller.inputDevices
+            let uids = resolveUIDsOrExit(for: type, identifiers: identifiers, devices: devices, listKnown: false)
+            controller.setPriorities(type: type, orderedUIDs: uids, refresh: false)
+        }
         print("Priority updated for \(type.rawValue) devices")
     }
 
     private func handleForget(_ args: [String]) {
-        guard let uid = args.first else {
-            print("Usage: audio-priority forget <uid>")
+        var working = args
+        let outputOnly = takeFlag("--output", from: &working)
+        let inputOnly = takeFlag("--input", from: &working)
+        let includeKnown = takeFlag("--known", from: &working)
+
+        guard !(outputOnly && inputOnly) else {
+            print("Usage: audio-priority forget --output <indexes...> OR audio-priority forget --input <indexes...>")
             exit(1)
         }
-        controller.forgetDevice(uid: uid)
+
+        let type: AudioDeviceType
+        if outputOnly || inputOnly {
+            type = outputOnly ? .output : .input
+        } else {
+            guard !working.isEmpty else {
+                print("Usage: audio-priority forget <input|output> <indexes...>")
+                exit(1)
+            }
+            type = parseType(working.removeFirst())
+        }
+
+        let identifiers = identifierResolver.splitIdentifiers(working)
+        guard !identifiers.isEmpty else {
+            if outputOnly || inputOnly {
+                print("Usage: audio-priority forget --\(type == .output ? "output" : "input") <indexes...>")
+            } else {
+                print("Usage: audio-priority forget <input|output> <indexes...>")
+            }
+            exit(1)
+        }
+
+        let devices: [AudioDevice]
+        if includeKnown {
+            devices = knownDevices(for: type)
+        } else {
+            controller.refreshDevices()
+            devices = type == .output ? controller.outputDevices : controller.inputDevices
+        }
+
+        let uids = resolveUIDsOrExit(for: type, identifiers: identifiers, devices: devices, listKnown: includeKnown)
+        var seen = Set<String>()
+        for uid in uids where seen.insert(uid).inserted {
+            controller.forgetDevice(uid: uid, type: type)
+        }
         print("Device forgotten")
     }
 
@@ -217,6 +410,23 @@ final class AudioPriorityCLI {
         print("Applied highest priority devices")
     }
 
+    private func printPriorityList(title: String, type: AudioDeviceType, known: [StoredDevice]) {
+        let uids = controller.priorityManager.getPriorityUIDs(type: type)
+        print("\(title):")
+        guard !uids.isEmpty else {
+            print("  (none)")
+            return
+        }
+        let knownByKey = Dictionary(uniqueKeysWithValues: known.map { device in
+            ("\(device.uid)::\(device.isInput)", device)
+        })
+        for (index, uid) in uids.enumerated() {
+            let key = "\(uid)::\(type == .input)"
+            let name = knownByKey[key]?.name ?? "Unknown device"
+            print("  \(index + 1) - \(name) | \(uid)")
+        }
+    }
+
     private func listKnownDevices(types: [AudioDeviceType]) {
         let known = controller.priorityManager.getKnownDevices()
         for type in types {
@@ -226,21 +436,58 @@ final class AudioPriorityCLI {
                 print("  (none)")
                 continue
             }
-            for device in matching {
-                print("  \(device.name) | \(device.uid) | last seen \(device.lastSeenRelative)")
+            for (index, device) in matching.enumerated() {
+                print("  \(index + 1) - \(device.name) | last seen \(device.lastSeenRelative)")
             }
         }
     }
 
-    private func printDevices(title: String, devices: [AudioDevice], currentId: AudioObjectID?) {
+    private func printJSONList(types: [AudioDeviceType], includeKnown: Bool) {
+        let payload: AudioPriorityJSONListPayload
+        if includeKnown {
+            controller.refreshDevices()
+            let known = controller.priorityManager.getKnownDevices()
+            let connected = controller.outputDevices + controller.inputDevices
+            payload = AudioPriorityJSON.listPayload(knownDevices: known, connectedDevices: connected)
+        } else {
+            controller.refreshDevices()
+            payload = AudioPriorityJSON.listPayload(
+                known: false,
+                outputDevices: controller.outputDevices,
+                inputDevices: controller.inputDevices
+            )
+        }
+
+        let filtered = AudioPriorityJSONListPayload(
+            known: payload.known,
+            output: types.contains(.output) ? payload.output : [],
+            input: types.contains(.input) ? payload.input : []
+        )
+
+        printJSON(filtered)
+    }
+
+    private func printJSON<T: Encodable>(_ payload: T) {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            let data = try encoder.encode(payload)
+            if let text = String(data: data, encoding: .utf8) {
+                print(text)
+            }
+        } catch {
+            writeStderr("Failed to encode JSON output: \(error.localizedDescription)")
+            exit(1)
+        }
+    }
+
+    private func printDevices(title: String, devices: [AudioDevice]) {
         print("\(title):")
         if devices.isEmpty {
             print("  (none)")
         } else {
             for (index, device) in devices.enumerated() {
-                let marker = device.id == currentId ? "*" : " "
-                let connected = device.isConnected ? "connected" : "disconnected"
-                print("  [\(index + 1)]\(marker) \(device.name) | \(device.uid) | \(connected)")
+                print("  \(index + 1) - \(device.name)")
             }
         }
     }
@@ -272,36 +519,26 @@ final class AudioPriorityCLI {
         return true
     }
 
-    private func splitIdentifiers(_ args: [String]) -> [String] {
-        var identifiers: [String] = []
-        for arg in args {
-            let parts = arg.split(separator: ",").map { String($0) }
-            for part in parts where !part.isEmpty {
-                identifiers.append(part)
+    private func resolveUIDsOrExit(for type: AudioDeviceType, identifiers: [String], devices: [AudioDevice], listKnown: Bool) -> [String] {
+        do {
+            return try identifierResolver.resolveUIDs(type: type, identifiers: identifiers, devices: devices)
+        } catch {
+            print(error.localizedDescription)
+            if listKnown {
+                print("Use audio-priority list --known --\(type == .output ? "output" : "input") to see indexes.")
+            } else {
+                print("Use audio-priority list --\(type == .output ? "output" : "input") to see indexes.")
             }
+            exit(1)
         }
-        return identifiers
     }
 
-    private func resolveUIDs(for type: AudioDeviceType, identifiers: [String]) -> [String] {
-        controller.refreshDevices()
-        let devices = type == .output ? controller.outputDevices : controller.inputDevices
-        var uids: [String] = []
-
-        for identifier in identifiers {
-            if let index = Int(identifier) {
-                let zeroBased = index - 1
-                guard zeroBased >= 0, zeroBased < devices.count else {
-                    print("Invalid index \(index). Use audio-priority list --\(type == .output ? "output" : "input") to see indexes.")
-                    exit(1)
-                }
-                uids.append(devices[zeroBased].uid)
-            } else {
-                uids.append(identifier)
-            }
+    private func knownDevices(for type: AudioDeviceType) -> [AudioDevice] {
+        let known = controller.priorityManager.getKnownDevices()
+            .filter { $0.isInput == (type == .input) }
+        return known.map { device in
+            AudioDevice(id: 0, uid: device.uid, name: device.name, type: type, isConnected: false)
         }
-
-        return uids
     }
 
     private func currentExecutablePath() -> String {
@@ -309,8 +546,30 @@ final class AudioPriorityCLI {
         return URL(fileURLWithPath: path).resolvingSymlinksInPath().path
     }
 
+    private func resolveInstallDestination(pathArg: String?, sourcePathArg: String?) -> String? {
+        if let pathArg {
+            return expandTilde(pathArg)
+        }
+        guard sourcePathArg == nil else {
+            return nil
+        }
+        return defaultInstallPath()
+    }
+
+    private func defaultInstallPath() -> String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".local")
+            .appendingPathComponent("bin")
+            .path
+    }
+
+    private func expandTilde(_ path: String) -> String {
+        (path as NSString).expandingTildeInPath
+    }
+
     private func installBinary(from sourcePath: String, to destinationPath: String) throws -> String {
         let fm = FileManager.default
+        let sourceURL = URL(fileURLWithPath: sourcePath)
         let destinationURL = URL(fileURLWithPath: destinationPath)
         let destinationIsDir = (try? destinationURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
         let finalURL: URL
@@ -330,8 +589,156 @@ final class AudioPriorityCLI {
             try fm.removeItem(at: finalURL)
         }
 
-        try fm.copyItem(at: URL(fileURLWithPath: sourcePath), to: finalURL)
-        return finalURL.path
+        let destinationFrameworkURL = frameworkURL(near: finalURL)
+
+        do {
+            try fm.copyItem(at: sourceURL, to: finalURL)
+            try copyFrameworkIfPresent(from: sourceURL, to: finalURL)
+            return finalURL.path
+        } catch {
+            if fm.fileExists(atPath: finalURL.path) {
+                try? fm.removeItem(at: finalURL)
+            }
+            if fm.fileExists(atPath: destinationFrameworkURL.path) {
+                try? fm.removeItem(at: destinationFrameworkURL)
+            }
+            let frameworkDir = destinationFrameworkURL.deletingLastPathComponent()
+            if let contents = try? fm.contentsOfDirectory(atPath: frameworkDir.path), contents.isEmpty {
+                try? fm.removeItem(at: frameworkDir)
+            }
+            throw error
+        }
+    }
+
+    private func copyFrameworkIfPresent(from sourceURL: URL, to binaryURL: URL) throws {
+        let fm = FileManager.default
+        let sourceFrameworkURL = sourceURL.deletingLastPathComponent()
+            .appendingPathComponent("Frameworks")
+            .appendingPathComponent("AudioPriorityCore.framework")
+
+        let destinationFrameworkURL = frameworkURL(near: binaryURL)
+        let destinationFrameworkDir = destinationFrameworkURL.deletingLastPathComponent()
+
+        guard fm.fileExists(atPath: sourceFrameworkURL.path) else { return }
+
+        if !fm.fileExists(atPath: destinationFrameworkDir.path) {
+            try fm.createDirectory(at: destinationFrameworkDir, withIntermediateDirectories: true)
+        }
+
+        if fm.fileExists(atPath: destinationFrameworkURL.path) {
+            try fm.removeItem(at: destinationFrameworkURL)
+        }
+
+        try fm.copyItem(at: sourceFrameworkURL, to: destinationFrameworkURL)
+    }
+
+    private func requireFrameworkPresent(near programPath: String) throws {
+        let fm = FileManager.default
+        let frameworkURL = frameworkURL(near: programPath)
+
+        if !fm.fileExists(atPath: frameworkURL.path) {
+            throw InstallError(message: "AudioPriorityCore.framework not found next to the binary. Keep Frameworks/AudioPriorityCore.framework alongside the executable.")
+        }
+    }
+
+    private func launchAgentProgramPath() -> String? {
+        let plistURL = LaunchAgentManager.agentURL
+        guard let data = try? Data(contentsOf: plistURL) else {
+            return nil
+        }
+        guard let plist = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any] else {
+            return nil
+        }
+        if let programArguments = plist["ProgramArguments"] as? [String], let programPath = programArguments.first {
+            return programPath
+        }
+        if let programPath = plist["Program"] as? String {
+            return programPath
+        }
+        return nil
+    }
+
+    private func removeInstalledBinary(at programPath: String) {
+        let url = URL(fileURLWithPath: programPath)
+        guard url.lastPathComponent == "audio-priority" else {
+            writeStderr("Skipping binary removal (unexpected path): \(programPath)")
+            return
+        }
+
+        let fm = FileManager.default
+        let frameworkURL = frameworkURL(near: url)
+
+        if fm.fileExists(atPath: frameworkURL.path) {
+            do {
+                try fm.removeItem(at: frameworkURL)
+            } catch {
+                writeStderr("Failed to remove framework: \(error.localizedDescription)")
+            }
+        }
+
+        if fm.fileExists(atPath: url.path) {
+            do {
+                try fm.removeItem(at: url)
+                print("Removed binary at \(programPath)")
+            } catch {
+                writeStderr("Failed to remove binary: \(error.localizedDescription)")
+            }
+        }
+
+        let frameworkDir = frameworkURL.deletingLastPathComponent()
+        if let contents = try? fm.contentsOfDirectory(atPath: frameworkDir.path), contents.isEmpty {
+            try? fm.removeItem(at: frameworkDir)
+        }
+    }
+
+    private func writeStderr(_ message: String) {
+        guard let data = (message + "\n").data(using: .utf8) else { return }
+        FileHandle.standardError.write(data)
+    }
+
+    private func validateBinaryPath(_ path: String) -> Bool {
+        let fm = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDirectory), !isDirectory.boolValue else {
+            return false
+        }
+        return fm.isExecutableFile(atPath: path)
+    }
+
+    private func frameworkURL(near programPath: String) -> URL {
+        frameworkURL(near: URL(fileURLWithPath: programPath))
+    }
+
+    private func frameworkURL(near binaryURL: URL) -> URL {
+        binaryURL.deletingLastPathComponent()
+            .appendingPathComponent("Frameworks")
+            .appendingPathComponent("AudioPriorityCore.framework")
+    }
+
+    private func cleanupInstall(at programPath: String) {
+        let fm = FileManager.default
+        let binaryURL = URL(fileURLWithPath: programPath)
+        let frameworkURL = frameworkURL(near: binaryURL)
+
+        if fm.fileExists(atPath: frameworkURL.path) {
+            try? fm.removeItem(at: frameworkURL)
+        }
+        if fm.fileExists(atPath: binaryURL.path) {
+            try? fm.removeItem(at: binaryURL)
+        }
+
+        let frameworkDir = frameworkURL.deletingLastPathComponent()
+        if let contents = try? fm.contentsOfDirectory(atPath: frameworkDir.path), contents.isEmpty {
+            try? fm.removeItem(at: frameworkDir)
+        }
+    }
+
+    private struct InstallError: LocalizedError {
+        let message: String
+
+        var errorDescription: String? {
+            message
+        }
     }
 
     private func printUsage() {
@@ -341,15 +748,23 @@ Audio Priority CLI
 Usage:
   audio-priority run
   audio-priority install [--path <dir|path>] [--bin <path>] [--no-start]
-  audio-priority uninstall
+  audio-priority uninstall [--keep-binary]
   audio-priority start
   audio-priority stop
-  audio-priority status
-  audio-priority list [--output] [--input] [--known]
-  audio-priority set <input|output> <uid|index...>
-  audio-priority set --output <uid|index...>
-  audio-priority set --input <uid|index...>
-  audio-priority forget <uid>
+  audio-priority status [--json]
+  audio-priority list [--output] [--input] [--known] [--json]
+  audio-priority priorities [--output] [--input] [--json]
+  audio-priority set <input|output> <indexes...>
+  audio-priority set --output <indexes...>
+  audio-priority set --input <indexes...>
+  audio-priority set <input|output> --uids <uids...>
+  audio-priority set --output --uids <uids...>
+  audio-priority set --input --uids <uids...>
+  audio-priority forget <input|output> <indexes...>
+  audio-priority forget --output <indexes...>
+  audio-priority forget --input <indexes...>
+  audio-priority forget --known --output <indexes...>
+  audio-priority forget --known --input <indexes...>
   audio-priority mode <auto|manual>
   audio-priority apply
 """)

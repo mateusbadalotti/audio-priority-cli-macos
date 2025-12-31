@@ -27,38 +27,81 @@ struct LaunchAgentManager {
 
     static func install(programPath: String, start: Bool) throws {
         try ensureLaunchAgentsDirectory()
+        let fm = FileManager.default
+        let hadLogDirectory = fm.fileExists(atPath: logDirectoryURL.path)
         try ensureLogDirectory()
+        let existingPlistData = fm.contents(atPath: agentURL.path)
+        let wasLoaded = isLoaded()
         let plist = plistDictionary(programPath: programPath)
         let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
-        try data.write(to: agentURL, options: .atomic)
-        if isLoaded() {
-            _ = launchctl(args: ["bootout", serviceDomain(), agentURL.path])
-        }
-        if start {
-            _ = launchctl(args: ["bootstrap", serviceDomain(), agentURL.path])
+        do {
+            try data.write(to: agentURL, options: .atomic)
+            if isLoaded() {
+                let result = launchctl(args: ["bootout", serviceDomain(), agentURL.path])
+                if result.exitCode != 0 {
+                    throw LaunchAgentError.launchctlFailed(command: "bootout", stderr: result.stderr)
+                }
+            }
+            if start {
+                let result = launchctl(args: ["bootstrap", serviceDomain(), agentURL.path])
+                if result.exitCode != 0 {
+                    throw LaunchAgentError.launchctlFailed(command: "bootstrap", stderr: result.stderr)
+                }
+            }
+        } catch {
+            if let existingPlistData {
+                try? existingPlistData.write(to: agentURL, options: .atomic)
+                if wasLoaded {
+                    _ = launchctl(args: ["bootstrap", serviceDomain(), agentURL.path])
+                }
+            } else if fm.fileExists(atPath: agentURL.path) {
+                try? fm.removeItem(at: agentURL)
+            }
+            if !hadLogDirectory, fm.fileExists(atPath: logDirectoryURL.path) {
+                let contents = (try? fm.contentsOfDirectory(atPath: logDirectoryURL.path)) ?? []
+                if contents.isEmpty {
+                    try? fm.removeItem(at: logDirectoryURL)
+                }
+            }
+            throw error
         }
     }
 
     static func uninstall() throws {
         if isLoaded() {
-            _ = launchctl(args: ["bootout", serviceDomain(), agentURL.path])
+            let result = launchctl(args: ["bootout", serviceDomain(), agentURL.path])
+            if result.exitCode != 0 {
+                throw LaunchAgentError.launchctlFailed(command: "bootout", stderr: result.stderr)
+            }
         }
         if FileManager.default.fileExists(atPath: agentURL.path) {
             try FileManager.default.removeItem(at: agentURL)
         }
-    }
-
-    static func start() {
-        if isLoaded() {
-            _ = launchctl(args: ["kickstart", "-k", "\(serviceDomain())/\(label)"])
-        } else {
-            _ = launchctl(args: ["bootstrap", serviceDomain(), agentURL.path])
+        if FileManager.default.fileExists(atPath: logDirectoryURL.path) {
+            try? FileManager.default.removeItem(at: logDirectoryURL)
         }
     }
 
-    static func stop() {
+    static func start() throws {
         if isLoaded() {
-            _ = launchctl(args: ["bootout", serviceDomain(), agentURL.path])
+            let result = launchctl(args: ["kickstart", "-k", "\(serviceDomain())/\(label)"])
+            if result.exitCode != 0 {
+                throw LaunchAgentError.launchctlFailed(command: "kickstart", stderr: result.stderr)
+            }
+        } else {
+            let result = launchctl(args: ["bootstrap", serviceDomain(), agentURL.path])
+            if result.exitCode != 0 {
+                throw LaunchAgentError.launchctlFailed(command: "bootstrap", stderr: result.stderr)
+            }
+        }
+    }
+
+    static func stop() throws {
+        if isLoaded() {
+            let result = launchctl(args: ["bootout", serviceDomain(), agentURL.path])
+            if result.exitCode != 0 {
+                throw LaunchAgentError.launchctlFailed(command: "bootout", stderr: result.stderr)
+            }
         }
     }
 
@@ -131,5 +174,20 @@ struct LaunchAgentManager {
         let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
         let stderr = String(data: stderrData, encoding: .utf8) ?? ""
         return (process.terminationStatus, stdout, stderr)
+    }
+
+    enum LaunchAgentError: LocalizedError {
+        case launchctlFailed(command: String, stderr: String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .launchctlFailed(command, stderr):
+                let detail = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                if detail.isEmpty {
+                    return "launchctl \(command) failed."
+                }
+                return "launchctl \(command) failed: \(detail)"
+            }
+        }
     }
 }

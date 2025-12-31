@@ -18,5 +18,9 @@ rm -f dist/audio-priority
 cp .build/Build/Products/Release/audio-priority dist/
 chmod +x dist/audio-priority
 
+mkdir -p dist/Frameworks
+rm -rf dist/Frameworks/AudioPriorityCore.framework
+cp -R .build/Build/Products/Release/AudioPriorityCore.framework dist/Frameworks/
+
 echo ""
 echo "Build complete: dist/audio-priority"
