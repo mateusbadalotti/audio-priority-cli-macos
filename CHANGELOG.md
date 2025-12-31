@@ -13,3 +13,6 @@ All notable changes to this project will be documented in this file.
 - `set --uids` support for specifying device UIDs directly.
 - Installer copies the binary and framework together; default install path `~/.local/bin`.
 - Uninstall cleanup for installed binary/framework (`--keep-binary` to skip removal).
+
+### Changed
+- Migrated to Swift 6.2.
