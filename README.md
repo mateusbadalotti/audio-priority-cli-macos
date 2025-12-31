@@ -47,98 +47,40 @@ Note: running tests requires macOS 14 or later.
 By default, the `install` command copies the binary to `~/.local/bin`, writes a LaunchAgent to `~/Library/LaunchAgents/com.audio-priority.daemon.plist`, and starts it.
 If you use `--path`, the installer copies the binary to that location instead. In both cases, it also copies `Frameworks/AudioPriorityCore.framework` alongside the binary.
 
-## Usage
+## Quick Start
 
 ```bash
-audio-priority
-audio-priority --output
-audio-priority --input --json
-audio-priority status
-audio-priority status --json
+# List output devices (indexes shown in order)
 audio-priority list --output
-audio-priority list --known
-audio-priority list --output --json
-audio-priority set output 1 2
-audio-priority set --output 1,2,6,3,4,5
-audio-priority set --output --uids "BuiltInSpeakerDevice" "USB Audio"
-audio-priority mode manual
-audio-priority mode auto
+
+# Set output priority by index (1 = highest priority)
+audio-priority set output 2 1 3
+
+# Apply the highest-priority connected devices now
 audio-priority apply
-audio-priority forget-disconnected
+```
+
+## Common Commands
+
+```bash
+audio-priority [--output] [--input] [--json]   # show priorities (default)
+audio-priority list [--output] [--input] [--known] [--json]
+audio-priority set <input|output> <indexes...>
+audio-priority set <input|output> --uids <uids...>
+audio-priority mode <auto|manual>
+audio-priority apply
+audio-priority forget-disconnected [--output] [--input]
+audio-priority status [--json]
 audio-priority --version
 ```
 
 ### Daemon Control
 
 ```bash
-audio-priority install          # install LaunchAgent and start it
-audio-priority uninstall        # remove LaunchAgent and installed binary
-audio-priority start            # start/refresh LaunchAgent
-audio-priority stop             # stop LaunchAgent
-audio-priority --version        # print version
-```
-
-### Command Reference
-
-```text
-audio-priority [--output] [--input] [--json]
 audio-priority install [--path <dir|path>] [--bin <path>] [--no-start]
 audio-priority uninstall [--keep-binary]
 audio-priority start
 audio-priority stop
-audio-priority status
-audio-priority status --json
-audio-priority list [--output] [--input] [--known] [--json]
-audio-priority set <input|output> <indexes...>
-audio-priority set --output <indexes...>
-audio-priority set --input <indexes...>
-audio-priority set <input|output> --uids <uids...>
-audio-priority set --output --uids <uids...>
-audio-priority set --input --uids <uids...>
-audio-priority forget-disconnected [--output] [--input]
-audio-priority mode <auto|manual>
-audio-priority apply
-audio-priority --version
-audio-priority --help
-```
-
-### Command Details
-
-```text
-install
-  --path <dir|path>  Copy the current binary into a destination dir or path and use that for the LaunchAgent (defaults to ~/.local/bin).
-  --bin <path>       Use a different binary path without copying (skips the default install path).
-  --no-start         Write the LaunchAgent but do not start it.
-
-uninstall
-  --keep-binary  Keep the installed binary and framework in place.
-
-status
-  --json  Output JSON (includes LaunchAgent status, mode, and current default devices).
-
-list
-  --output  Show output devices only.
-  --input   Show input devices only.
-  --known   Show remembered devices (including disconnected).
-  --json    Output JSON (includes indexes, uid, name, type, and connection state; known list includes lastSeen).
-
-default (no command)
-  --output  Show output priorities only.
-  --input   Show input priorities only.
-  --json    Output JSON (includes priority order, names when known, and connection state).
-
-set
-  Provide list indexes in the desired order. Missing devices are appended based on known history.
-  --uids  Provide device UIDs instead of numeric indexes.
-
-forget-disconnected
-  Forget all disconnected devices from the known list.
-  --output  Only forget disconnected output devices.
-  --input   Only forget disconnected input devices.
-
-mode
-  auto   Enable automatic switching (default behavior).
-  manual Disable auto-switching and let you manage defaults yourself.
 ```
 
 ## How It Works
