@@ -34,6 +34,10 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
+      - name: Test
+        run: |
+          xcodebuild -scheme AudioPriorityTests test
+
       - name: Package CLI
         run: |
           mkdir -p release
